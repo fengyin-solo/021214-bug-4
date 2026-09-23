@@ -188,8 +188,8 @@ import {
   loadPdfDocument, renderPageToCanvas, buildTextLayer,
   buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
   searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
-  type SearchResult, type SearchMatch, type PageSearchResult,
+  type PdfjsDocument, type PdfjsPage,
+  type SearchResult, type SearchMatch, type MatchRects,
 } from '@/utils/pdf-engine'
 
 const sampleFiles = [
@@ -248,6 +248,10 @@ const textLayerRefs = new Map<number, HTMLDivElement>()
 const annotationLayerRefs = new Map<number, HTMLDivElement>()
 const highlightLayerRefs = new Map<number, HTMLDivElement>()
 const pageWrapperRefs = new Map<number, HTMLElement>()
+/** 每页 TextLayer 中与文本项一一对应的 span（由 buildTextLayer 返回），用于高亮定位 */
+const textSpansByPage = new Map<number, HTMLSpanElement[]>()
+/** 每页已构建命中的测量矩形（页内 matchIndex -> rects），用于精确跳转 */
+const matchRectsByPage = new Map<number, Map<number, MatchRects>>()
 const renderedPages = new Set<string>()
 const renderedPageOrder: number[] = []
 const MAX_RENDERED = 15
@@ -342,11 +346,37 @@ function clearSearch() {
 
 function clearAllHighlights() {
   highlightVersion++
+  matchRectsByPage.clear()
   for (const container of highlightLayerRefs.values()) {
     clearHighlightLayer(container)
   }
 }
 
+/**
+ * 构建指定页的高亮矩形。矩形直接测量自真实 TextLayer，因此与屏幕文字对齐。
+ * 页面尚未渲染（还没有 TextLayer spans）时跳过，等渲染完成后由 renderPage 补建。
+ */
+function buildPageHighlights(pageNum: number, matches: SearchMatch[]) {
+  const container = highlightLayerRefs.get(pageNum)
+  const spans = textSpansByPage.get(pageNum)
+  const dim = pageDimensions.get(pageNum)
+  if (!container || !spans || !dim) return
+
+  let pageCurrentIdx: number | undefined
+  if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
+    const currentMatch = allMatches.value[currentMatchIndex.value]
+    if (currentMatch && currentMatch.pageNumber === pageNum) {
+      pageCurrentIdx = currentMatch.matchIndex
+    }
+  }
+
+  const measured = buildHighlightLayer(
+    container, matches, spans, dim.width, dim.height, pageCurrentIdx,
+  )
+  matchRectsByPage.set(pageNum, measured)
+}
+
+/** 为当前已渲染的所有命中页刷新高亮；未渲染页在渲染完成时自动补建 */
 function refreshHighlights() {
   const ver = ++highlightVersion
   const matchesByPage = new Map<number, SearchMatch[]>()
@@ -358,31 +388,9 @@ function refreshHighlights() {
   }
 
   for (const [pageNum, matches] of matchesByPage) {
-    const container = highlightLayerRefs.get(pageNum)
-    if (!container) continue
-
-    const base = pageBaseDims.get(pageNum)
-    if (!base) continue
-
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
-      scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
-
-    let pageCurrentIdx: number | undefined
-    if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
-      const currentMatch = allMatches.value[currentMatchIndex.value]
-      if (currentMatch && currentMatch.pageNumber === pageNum) {
-        pageCurrentIdx = currentMatch.matchIndex
-      }
-    }
-
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
+    buildPageHighlights(pageNum, matches)
   }
+  void ver
 }
 
 function getCurrentMatch(): SearchMatch | null {
@@ -407,8 +415,8 @@ function nextMatch() {
   )
   const match = getCurrentMatch()
   if (match) {
-    jumpToMatch(match)
-    refreshHighlights()
+    // jumpToMatch 内部会在目标页渲染完成后统一重建高亮（含当前项高亮）
+    void jumpToMatch(match)
   }
 }
 
@@ -417,12 +425,11 @@ function prevMatch() {
   currentMatchIndex.value = Math.max(currentMatchIndex.value - 1, 0)
   const match = getCurrentMatch()
   if (match) {
-    jumpToMatch(match)
-    refreshHighlights()
+    void jumpToMatch(match)
   }
 }
 
-function jumpToMatch(match: SearchMatch) {
+async function jumpToMatch(match: SearchMatch) {
   const idx = allMatches.value.findIndex(
     (m) => m.pageNumber === match.pageNumber && m.matchIndex === match.matchIndex,
   )
@@ -433,20 +440,34 @@ function jumpToMatch(match: SearchMatch) {
   const wrapper = pageWrapperRefs.get(match.pageNumber)
   if (!wrapper || !containerRef.value) return
 
-  const containerTop = containerRef.value.scrollTop
-  const containerHeight = containerRef.value.clientHeight
-  const wrapperTop = wrapper.offsetTop
-  const wrapperHeight = wrapper.offsetHeight
-
-  const matchTop = match.transform[5] * scale.value
-  const targetTop = wrapperTop + matchTop - containerHeight / 2
-
-  containerRef.value.scrollTo({
-    top: targetTop,
-    behavior: 'smooth',
-  })
-
+  // 目标页可能因懒加载尚未渲染（没有 TextLayer/高亮），先确保其渲染完成
+  await ensurePageRendered(match.pageNumber)
   refreshHighlights()
+
+  const container = containerRef.value
+  const containerHeight = container.clientHeight
+  const wrapperTop = wrapper.offsetTop
+
+  // 优先使用在真实 TextLayer 上测得的命中矩形，保证滚动位置与高亮完全对应
+  const measured = matchRectsByPage.get(match.pageNumber)?.get(match.matchIndex)
+  let matchTop: number
+  if (measured) {
+    matchTop = measured.boundingTop
+  } else {
+    // 兜底：文本项 transform 的基线 Y（PDF 坐标），近似换算到页面 CSS 坐标
+    const base = pageBaseDims.get(match.pageNumber)
+    const dim = pageDimensions.get(match.pageNumber)
+    const s = scale.value
+    if (base && dim) {
+      const approximateTop = (base.baseHeight - match.fallbackTransformY) * s
+      matchTop = Math.max(0, approximateTop - 8 * s)
+    } else {
+      matchTop = 0
+    }
+  }
+
+  const targetTop = wrapperTop + matchTop - containerHeight / 2
+  container.scrollTo({ top: targetTop, behavior: 'smooth' })
 }
 
 function togglePageGroup(pageNumber: number) {
@@ -462,11 +483,13 @@ function highlightMatchText(match: SearchMatch, pageText: string): string {
   const start = Math.max(0, match.startOffset - contextLength)
   const end = Math.min(pageText.length, match.endOffset + contextLength)
 
+  // 页面连续文本中的换行/多空白在侧栏里按读者看到的样子压成一个空格
+  const normalize = (str: string) => str.replace(/\s+/g, ' ').trim()
   const before = start > 0 ? '...' : ''
   const after = end < pageText.length ? '...' : ''
-  const prefix = pageText.substring(start, match.startOffset)
-  const matched = pageText.substring(match.startOffset, match.endOffset)
-  const suffix = pageText.substring(match.endOffset, end)
+  const prefix = normalize(pageText.substring(start, match.startOffset))
+  const matched = normalize(pageText.substring(match.startOffset, match.endOffset))
+  const suffix = normalize(pageText.substring(match.endOffset, end))
 
   const escapeHtml = (str: string) => str
     .replace(/&/g, '&amp;')
@@ -532,6 +555,8 @@ function recyclePage(n: number) {
   if (a) a.innerHTML = ''
   const h = highlightLayerRefs.get(n)
   if (h) h.innerHTML = ''
+  textSpansByPage.delete(n)
+  matchRectsByPage.delete(n)
   renderedPages.delete(key)
   const idx = renderedPageOrder.indexOf(n)
   if (idx !== -1) renderedPageOrder.splice(idx, 1)
@@ -570,8 +595,9 @@ async function renderPage(n: number, ver: number) {
   // 渲染后用实际 viewport 修正尺寸（响应式更新 template）
   pageDimensions.set(n, { width: viewport.width, height: viewport.height })
 
-  await buildTextLayer(page, textDiv, viewport)
+  const spans = await buildTextLayer(page, textDiv, viewport)
   if (ver !== renderVersion) return
+  textSpansByPage.set(n, spans)
 
   if (annoDiv) await buildAnnotationLayer(page, annoDiv, viewport)
 
@@ -579,6 +605,28 @@ async function renderPage(n: number, ver: number) {
   const idx = renderedPageOrder.indexOf(n)
   if (idx !== -1) renderedPageOrder.splice(idx, 1)
   renderedPageOrder.push(n)
+
+  // 页面渲染完成后补建本页搜索高亮（跳转/滚动到此前未渲染的页时同样生效）
+  if (searchResult.totalMatches > 0) {
+    const pageMatches = allMatches.value.filter((m) => m.pageNumber === n)
+    if (pageMatches.length > 0) {
+      await nextTick()
+      if (ver === renderVersion) buildPageHighlights(n, pageMatches)
+    }
+  }
+}
+
+/** 确保某页在当前缩放下完成渲染（含 TextLayer），供跳转至懒加载页面时使用 */
+async function ensurePageRendered(n: number) {
+  const key = `${n}-${scale.value}`
+  if (renderedPages.has(key) && textSpansByPage.has(n)) return
+  const ver = renderVersion
+  try {
+    await renderPage(n, ver)
+  } catch (e) {
+    console.error(`渲染第${n}页失败:`, e)
+  }
+  await nextTick()
 }
 
 async function processQueue() {
@@ -650,12 +698,12 @@ watch(scale, async () => {
   if (!pdfDoc.value) return
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
+  textSpansByPage.clear(); matchRectsByPage.clear()
   recomputeScaledDimensions()
+  // 立即清空旧缩放下的高亮，避免过渡期间出现错位矩形；渲染完成后逐页补建
+  clearAllHighlights()
   await nextTick()
   scheduleRender()
-  if (searchResult.totalMatches > 0) {
-    refreshHighlights()
-  }
 })
 
 /* ---- 加载 PDF ---- */
@@ -667,6 +715,7 @@ async function loadPdf(url: string) {
   canvasRefs.clear(); textLayerRefs.clear()
   annotationLayerRefs.clear(); highlightLayerRefs.clear()
   pageWrapperRefs.clear()
+  textSpansByPage.clear(); matchRectsByPage.clear()
 
   searchCancelled.value = true
   searching.value = false
@@ -762,16 +811,20 @@ onUnmounted(() => {
   section { position: absolute; pointer-events: auto; }
   a { color: var(--primary-color); &:hover { opacity: 0.8; } }
 }
+.search-highlight-group {
+  position: absolute; top: 0; left: 0;
+  pointer-events: none;
+}
 .search-highlight {
   position: absolute;
   background: rgba(255, 235, 59, 0.55);
   border-radius: 2px;
   pointer-events: none;
   transition: background 0.2s;
-  &--active {
-    background: rgba(255, 152, 0, 0.7);
-    box-shadow: 0 0 0 2px rgba(255, 152, 0, 0.4);
-  }
+}
+.search-highlight-group--active .search-highlight {
+  background: rgba(255, 152, 0, 0.7);
+  box-shadow: 0 0 0 2px rgba(255, 152, 0, 0.4);
 }
 </style>
 
