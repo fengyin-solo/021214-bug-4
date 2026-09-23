@@ -168,8 +168,6 @@
                 :ref="(el) => setTextLayerRef(el as HTMLDivElement, pageNum)"/>
               <div class="pdf-page__annotation-layer annotationLayer"
                 :ref="(el) => setAnnotationLayerRef(el as HTMLDivElement, pageNum)"/>
-              <div class="pdf-page__highlight-layer"
-                :ref="(el) => setHighlightLayerRef(el as HTMLDivElement, pageNum)"/>
             </div>
             <div class="pdf-page__number">{{ pageNum }}</div>
           </div>
@@ -187,8 +185,8 @@ import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from
 import {
   loadPdfDocument, renderPageToCanvas, buildTextLayer,
   buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
-  searchDocument, buildHighlightLayer, clearHighlightLayer,
-  type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
+  searchDocument, applyTextLayerHighlights, clearTextLayerHighlights,
+  type PdfjsDocument, type PdfjsPage,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
 
@@ -246,7 +244,6 @@ const pageDimensions = reactive(new Map<number, { width: number; height: number 
 const canvasRefs = new Map<number, HTMLCanvasElement>()
 const textLayerRefs = new Map<number, HTMLDivElement>()
 const annotationLayerRefs = new Map<number, HTMLDivElement>()
-const highlightLayerRefs = new Map<number, HTMLDivElement>()
 const pageWrapperRefs = new Map<number, HTMLElement>()
 const renderedPages = new Set<string>()
 const renderedPageOrder: number[] = []
@@ -254,13 +251,11 @@ const MAX_RENDERED = 15
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 let renderVersion = 0
 let scrollRafId: number | null = null
-let highlightVersion = 0
 
 /* ---- Ref 绑定 ---- */
 function setCanvasRef(el: HTMLCanvasElement | null, n: number) { if (el) canvasRefs.set(n, el) }
 function setTextLayerRef(el: HTMLDivElement | null, n: number) { if (el) textLayerRefs.set(n, el) }
 function setAnnotationLayerRef(el: HTMLDivElement | null, n: number) { if (el) annotationLayerRefs.set(n, el) }
-function setHighlightLayerRef(el: HTMLDivElement | null, n: number) { if (el) highlightLayerRefs.set(n, el) }
 function setPageRef(el: HTMLElement | null, n: number) { if (el) pageWrapperRefs.set(n, el) }
 
 /* ---- Toast ---- */
@@ -341,47 +336,53 @@ function clearSearch() {
 }
 
 function clearAllHighlights() {
-  highlightVersion++
-  for (const container of highlightLayerRefs.values()) {
-    clearHighlightLayer(container)
+  for (const container of textLayerRefs.values()) {
+    clearTextLayerHighlights(container)
   }
 }
 
-function refreshHighlights() {
-  const ver = ++highlightVersion
-  const matchesByPage = new Map<number, SearchMatch[]>()
-  for (const match of allMatches.value) {
-    if (!matchesByPage.has(match.pageNumber)) {
-      matchesByPage.set(match.pageNumber, [])
-    }
-    matchesByPage.get(match.pageNumber)!.push(match)
-  }
+/** 在单页 Text Layer 上重建该页全部命中的 <mark> */
+function applyHighlightsToPage(
+  pageNumber: number,
+  container: HTMLDivElement,
+  activeMatch: SearchMatch | null,
+) {
+  const pageResult = searchResult.pages.find((p) => p.pageNumber === pageNumber)
+  if (!pageResult) return
 
-  for (const [pageNum, matches] of matchesByPage) {
-    const container = highlightLayerRefs.get(pageNum)
-    if (!container) continue
+  clearTextLayerHighlights(container)
 
-    const base = pageBaseDims.get(pageNum)
-    if (!base) continue
-
-    const viewport = {
-      width: base.baseWidth * scale.value,
-      height: base.baseHeight * scale.value,
-      scale: scale.value,
-      rotation: 0,
-      transform: [1, 0, 0, 1, 0, 0],
-      clone: () => ({ /* 简化的 clone，实际高亮层不需要完整 viewport */ }),
-    } as unknown as PdfjsViewport
-
-    let pageCurrentIdx: number | undefined
-    if (currentMatchIndex.value >= 0 && currentMatchIndex.value < allMatches.value.length) {
-      const currentMatch = allMatches.value[currentMatchIndex.value]
-      if (currentMatch && currentMatch.pageNumber === pageNum) {
-        pageCurrentIdx = currentMatch.matchIndex
+  const partsByItem = new Map<number, Array<{ charStart: number; charEnd: number }>>()
+  for (const match of pageResult.matches) {
+    for (const part of match.parts) {
+      const ranges = partsByItem.get(part.itemIndex)
+      if (ranges) {
+        ranges.push({ charStart: part.charStart, charEnd: part.charEnd })
+      } else {
+        partsByItem.set(part.itemIndex, [{ charStart: part.charStart, charEnd: part.charEnd }])
       }
     }
+  }
 
-    buildHighlightLayer(container, matches, viewport, pageCurrentIdx)
+  const pageActive = activeMatch && activeMatch.pageNumber === pageNumber ? activeMatch : null
+  applyTextLayerHighlights(container, partsByItem, pageActive)
+}
+
+/**
+ * 在已渲染页面的 Text Layer 内重建搜索高亮。
+ * 高亮直接包裹 Text Layer 中与字形对齐的 span，任何缩放下都与文字重合。
+ */
+function refreshHighlights() {
+  if (searchResult.totalMatches === 0) {
+    clearAllHighlights()
+    return
+  }
+
+  const currentMatch = getCurrentMatch()
+  for (const pageResult of searchResult.pages) {
+    const container = textLayerRefs.get(pageResult.pageNumber)
+    if (!container) continue
+    applyHighlightsToPage(pageResult.pageNumber, container, currentMatch)
   }
 }
 
@@ -433,13 +434,22 @@ function jumpToMatch(match: SearchMatch) {
   const wrapper = pageWrapperRefs.get(match.pageNumber)
   if (!wrapper || !containerRef.value) return
 
-  const containerTop = containerRef.value.scrollTop
-  const containerHeight = containerRef.value.clientHeight
-  const wrapperTop = wrapper.offsetTop
-  const wrapperHeight = wrapper.offsetHeight
+  // 以 .pdf-page（不含页码标签）的顶边为基准
+  const pageEl = wrapper.querySelector('.pdf-page') as HTMLElement | null
+  const pageTop = pageEl
+    ? pageEl.getBoundingClientRect().top -
+      containerRef.value.getBoundingClientRect().top +
+      containerRef.value.scrollTop
+    : wrapper.offsetTop
 
-  const matchTop = match.transform[5] * scale.value
-  const targetTop = wrapperTop + matchTop - containerHeight / 2
+  const containerHeight = containerRef.value.clientHeight
+
+  // match.top 是 PDF 坐标系（原点在左下）下的基线 y；.pdf-page 顶部对应
+  // CSS 坐标原点，换算成 CSS 坐标：cssTop = baseHeight - top
+  const base = pageBaseDims.get(match.pageNumber)
+  const baseHeight = base?.baseHeight ?? wrapper.offsetHeight / scale.value
+  const cssTop = Math.max(0, baseHeight - match.top) * scale.value
+  const targetTop = pageTop + cssTop - containerHeight / 2
 
   containerRef.value.scrollTo({
     top: targetTop,
@@ -462,11 +472,13 @@ function highlightMatchText(match: SearchMatch, pageText: string): string {
   const start = Math.max(0, match.startOffset - contextLength)
   const end = Math.min(pageText.length, match.endOffset + contextLength)
 
+  // 逻辑文本里保留着换行等空白，侧栏统一折叠成普通空格展示
+  const flatten = (s: string) => s.replace(/\s+/g, ' ').trim()
   const before = start > 0 ? '...' : ''
   const after = end < pageText.length ? '...' : ''
-  const prefix = pageText.substring(start, match.startOffset)
-  const matched = pageText.substring(match.startOffset, match.endOffset)
-  const suffix = pageText.substring(match.endOffset, end)
+  const prefix = flatten(pageText.substring(start, match.startOffset))
+  const matched = flatten(pageText.substring(match.startOffset, match.endOffset))
+  const suffix = flatten(pageText.substring(match.endOffset, end))
 
   const escapeHtml = (str: string) => str
     .replace(/&/g, '&amp;')
@@ -527,11 +539,9 @@ function recyclePage(n: number) {
   const c = canvasRefs.get(n)
   if (c) { c.width = 0; c.height = 0 }
   const t = textLayerRefs.get(n)
-  if (t) t.innerHTML = ''
+  if (t) t.innerHTML = '' // 高亮 <mark> 随 Text Layer 一并回收
   const a = annotationLayerRefs.get(n)
   if (a) a.innerHTML = ''
-  const h = highlightLayerRefs.get(n)
-  if (h) h.innerHTML = ''
   renderedPages.delete(key)
   const idx = renderedPageOrder.indexOf(n)
   if (idx !== -1) renderedPageOrder.splice(idx, 1)
@@ -572,6 +582,11 @@ async function renderPage(n: number, ver: number) {
 
   await buildTextLayer(page, textDiv, viewport)
   if (ver !== renderVersion) return
+
+  // Text Layer 重建后（首次渲染/回收后重渲染/缩放），重新应用搜索高亮
+  if (searchResult.totalMatches > 0) {
+    applyHighlightsToPage(n, textDiv, getCurrentMatch())
+  }
 
   if (annoDiv) await buildAnnotationLayer(page, annoDiv, viewport)
 
@@ -665,7 +680,7 @@ async function loadPdf(url: string) {
   renderedPages.clear(); renderedPageOrder.length = 0
   pageDimensions.clear(); pageBaseDims.clear()
   canvasRefs.clear(); textLayerRefs.clear()
-  annotationLayerRefs.clear(); highlightLayerRefs.clear()
+  annotationLayerRefs.clear()
   pageWrapperRefs.clear()
 
   searchCancelled.value = true
@@ -762,15 +777,18 @@ onUnmounted(() => {
   section { position: absolute; pointer-events: auto; }
   a { color: var(--primary-color); &:hover { opacity: 0.8; } }
 }
-.search-highlight {
-  position: absolute;
+.textLayer mark.search-highlight {
+  /* 高亮包裹在与字形精确对齐的 span 内，背景即文字的真实包围矩形 */
+  position: static;
   background: rgba(255, 235, 59, 0.55);
+  color: transparent;
   border-radius: 2px;
+  padding: 0;
+  margin: 0;
   pointer-events: none;
-  transition: background 0.2s;
-  &--active {
-    background: rgba(255, 152, 0, 0.7);
-    box-shadow: 0 0 0 2px rgba(255, 152, 0, 0.4);
+  &.search-highlight--active {
+    background: rgba(255, 152, 0, 0.75);
+    box-shadow: 0 0 0 1px rgba(255, 152, 0, 0.45);
   }
 }
 </style>
@@ -1009,11 +1027,5 @@ onUnmounted(() => {
   }
   &__text { color: var(--text-secondary); font-weight: 500; }
   &__progress { color: var(--text-tertiary); font-size: var(--font-size-sm); }
-}
-
-/* ---- 高亮层 ---- */
-.pdf-page__highlight-layer {
-  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-  pointer-events: none; z-index: 4;
 }
 </style>
